@@ -6,6 +6,8 @@ import { Client, Wallet, xrpToDrops } from "xrpl";
 const TRANSFER_AMOUNT = 1; // Amount to transfer (1 XRP)
 const TRANSFER_INTERVAL = 5; // Transfer every 5 seconds
 const MAX_TRANSACTIONS = 4; // Maximum number of transactions to show
+const WALLET1_KEY = 'xrpl_wallet1';
+const WALLET2_KEY = 'xrpl_wallet2';
 
 interface Transaction {
   id: string;
@@ -15,6 +17,48 @@ interface Transaction {
   from: string;
   to: string;
 }
+
+interface StoredWallet {
+  address: string;
+  seed: string;
+}
+
+// Helper function to manage wallet creation/retrieval
+const getOrCreateWallet = async (client: Client, storageKey: string): Promise<Wallet> => {
+  try {
+    // Try to get existing wallet from localStorage
+    const storedWallet = localStorage.getItem(storageKey);
+    if (storedWallet) {
+      const { seed } = JSON.parse(storedWallet) as StoredWallet;
+      const wallet = Wallet.fromSeed(seed);
+      
+      // Verify the wallet is valid and funded
+      try {
+        const balance = await client.getXrpBalance(wallet.address);
+        if (Number(balance) > 0) {
+          return wallet;
+        }
+      } catch (error) {
+        console.warn("Stored wallet validation failed:", error);
+      }
+    }
+
+    // If no valid wallet found, create and fund a new one
+    const { wallet } = await client.fundWallet();
+    
+    // Store the new wallet
+    const walletData: StoredWallet = {
+      address: wallet.address,
+      seed: wallet.seed!
+    };
+    localStorage.setItem(storageKey, JSON.stringify(walletData));
+    
+    return wallet;
+  } catch (error) {
+    console.error("Error in getOrCreateWallet:", error);
+    throw error;
+  }
+};
 
 export default function Home() {
   const [isCallActive, setIsCallActive] = useState(false);
@@ -37,20 +81,15 @@ export default function Home() {
         await xrplClient.connect();
         setClient(xrplClient);
 
-        // Create or load wallets
-        const testWallet1 = Wallet.generate();
-        const testWallet2 = Wallet.generate();
-
-        // Fund the wallets using testnet faucet
-        setStatus("Funding test wallets...");
-        const fundResponse1 = await xrplClient.fundWallet();
-        const fundResponse2 = await xrplClient.fundWallet();
+        setStatus("Initializing wallets...");
+        const testWallet1 = await getOrCreateWallet(xrplClient, WALLET1_KEY);
+        const testWallet2 = await getOrCreateWallet(xrplClient, WALLET2_KEY);
         
-        setWallet1(fundResponse1.wallet);
-        setWallet2(fundResponse2.wallet);
+        setWallet1(testWallet1);
+        setWallet2(testWallet2);
 
         // Get initial balances
-        await updateBalances(xrplClient, fundResponse1.wallet, fundResponse2.wallet);
+        await updateBalances(xrplClient, testWallet1, testWallet2);
         
         setIsLoading(false);
         setStatus("Ready to start call");
