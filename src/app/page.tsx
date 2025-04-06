@@ -163,6 +163,46 @@ export default function Home() {
   const [wallet2NFTs, setWallet2NFTs] = useState<NFTData[]>([]);
   const [selectedNFT, setSelectedNFT] = useState<NFTData | null>(null);
 
+  // Reset wallet function
+  const resetWallet = async (storageKey: string) => {
+    if (!client) return;
+    
+    try {
+      console.log('🔥 Resetting wallet:', { storageKey });
+      
+      // Remove the stored wallet
+      localStorage.removeItem(storageKey);
+      
+      // Create and fund a new wallet
+      const { wallet } = await client.fundWallet();
+      console.log('💸 New wallet funded:', { address: wallet.address });
+      
+      // Store the new wallet
+      const walletData: StoredWallet = {
+        address: wallet.address,
+        seed: wallet.seed!
+      };
+      localStorage.setItem(storageKey, JSON.stringify(walletData));
+      
+      // Update the wallet state
+      if (storageKey === WALLET1_KEY) {
+        setWallet1(wallet);
+      } else {
+        setWallet2(wallet);
+      }
+      
+      // Update balances
+      if (wallet1 && wallet2) {
+        await updateBalances(client, wallet1, wallet2);
+      }
+      
+      console.log('✅ Wallet reset complete');
+    } catch (error) {
+      console.error('❌ Wallet reset error:', error);
+      setStatus("Error resetting wallet");
+    }
+  };
+
   // Initialize XRPL client and wallets
   useEffect(() => {
     const initializeXRPL = async () => {
@@ -247,10 +287,11 @@ export default function Home() {
         TransactionType: "NFTokenMint" as const,
         Account: wallet1.address,
         NFTokenTaxon: icon.id,
-        Flags: 8,
+        Flags: 1, // Only burnable flag, making it non-transferable from the start
         URI: Buffer.from(JSON.stringify({
           name: icon.name,
-          icon: icon.emoji
+          icon: icon.emoji,
+          soulbound: true
         })).toString('hex').toUpperCase()
       };
 
@@ -296,15 +337,15 @@ export default function Home() {
     setTransactions(prev => [newTransaction, ...prev].slice(0, MAX_TRANSACTIONS));
 
     try {
-      // Step 1: Create the offer
-      console.log('📤 Creating NFT offer...');
+      // Step 1: Create the offer (only issuer can create offer for non-transferable NFT)
+      console.log('📤 Creating NFT offer as issuer...');
       const createOfferTx = {
         TransactionType: "NFTokenCreateOffer" as const,
-        Account: wallet1.address,
+        Account: wallet1.address, // Issuer can transfer even non-transferable tokens
         NFTokenID: nft.tokenId,
         Destination: wallet2.address,
         Amount: "0",
-        Flags: 1
+        Flags: 1 // tfSellToken flag
       };
 
       const preparedOffer = await client.autofill(createOfferTx);
@@ -339,37 +380,8 @@ export default function Home() {
         if (acceptResult.result.meta && typeof acceptResult.result.meta !== 'string' && 
             acceptResult.result.meta.TransactionResult === "tesSUCCESS") {
           
-          // After successful transfer, make the NFT soulbound by removing transfer flag
-          const makeSoulboundTx = {
-            TransactionType: "NFTokenBurn" as const,
-            Account: wallet2.address,
-            NFTokenID: nft.tokenId
-          };
-
-          // Mint a new soulbound version
-          const newSoulboundTx = {
-            TransactionType: "NFTokenMint" as const,
-            Account: wallet2.address,
-            NFTokenTaxon: 0,
-            Flags: 1, // Only burnable, not transferable (soulbound)
-            URI: Buffer.from(JSON.stringify({
-              name: nft.name,
-              icon: nft.icon,
-              soulbound: true,
-              originalTokenId: nft.tokenId
-            })).toString('hex').toUpperCase()
-          };
-
-          // Execute both transactions
-          const preparedBurn = await client.autofill(makeSoulboundTx);
-          const signedBurn = wallet2.sign(preparedBurn);
-          await client.submitAndWait(signedBurn.tx_blob);
-
-          const preparedMint = await client.autofill(newSoulboundTx);
-          const signedMint = wallet2.sign(preparedMint);
-          await client.submitAndWait(signedMint.tx_blob);
-          
-          // Reload NFTs for both wallets
+          // No need to burn and remint since the NFT is already non-transferable
+          // Just reload NFTs for both wallets
           const [updatedWallet1NFTs, updatedWallet2NFTs] = await Promise.all([
             loadWalletNFTs(client, wallet1.address),
             loadWalletNFTs(client, wallet2.address)
@@ -607,54 +619,64 @@ export default function Home() {
   return (
     <div className="relative min-h-screen p-8 bg-gray-50">
       {/* Transaction History */}
-      <div className="absolute top-4 left-1/2 -translate-x-1/2 w-[600px] bg-white p-4 rounded-lg shadow-md">
+      <div className="absolute top-4 left-1/2 -translate-x-1/2 w-[600px] bg-white p-4 rounded-lg shadow-md z-10">
         <div className="text-sm font-semibold mb-2">Recent Transactions</div>
-        <div className="space-y-1.5 max-h-[180px] overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-rounded-full scrollbar-track-rounded-full scrollbar-thumb-gray-300 scrollbar-track-gray-100">
-          {transactions.map((tx, index) => (
-            <div key={tx.id} className="flex items-center justify-between text-sm p-2 bg-gray-50 rounded hover:bg-gray-100 transition-colors">
-              <div className="flex items-center gap-2">
-                <span className="w-5 h-5 flex items-center justify-center bg-gray-200 rounded-full text-xs font-medium text-gray-700">
-                  {transactions.length - index}
-                </span>
-                <span className={`w-2 h-2 rounded-full ${
-                  tx.status === 'pending' ? 'bg-yellow-500' :
-                  tx.status === 'completed' ? 'bg-green-500' : 'bg-red-500'
-                }`} />
-                <span className="font-medium">
-                  {formatAddress(tx.from)} → {formatAddress(tx.to)}
-                  {tx.type === 'nft' && tx.nft && (
-                    <span className="ml-2 text-xs bg-purple-100 text-purple-800 px-2 py-0.5 rounded-full">
-                      NFT: {tx.nft.icon} {tx.nft.name}
-                    </span>
-                  )}
-                </span>
-              </div>
-              <div className="flex items-center gap-3">
-                {tx.type === 'xrp' ? (
-                  <span className="font-medium">{tx.amount} XRP</span>
-                ) : (
-                  <span className="font-medium text-purple-600">NFT</span>
-                )}
-                <span className={`text-xs px-2 py-0.5 rounded-full ${
-                  tx.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
-                  tx.status === 'completed' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
-                }`}>
-                  {tx.status}
-                </span>
-              </div>
-            </div>
-          ))}
-          {transactions.length === 0 && (
+        <div className="space-y-1.5 max-h-[180px] overflow-y-auto">
+          {transactions.length === 0 ? (
             <div className="text-center text-gray-500 text-sm py-4">
               No transactions yet
             </div>
+          ) : (
+            transactions.map((tx, index) => (
+              <div key={tx.id} className="flex items-center justify-between text-sm p-2 bg-gray-50 rounded hover:bg-gray-100 transition-colors">
+                <div className="flex items-center gap-2">
+                  <span className="w-5 h-5 flex items-center justify-center bg-gray-200 rounded-full text-xs font-medium text-gray-700">
+                    {transactions.length - index}
+                  </span>
+                  <span className={`w-2 h-2 rounded-full ${
+                    tx.status === 'pending' ? 'bg-yellow-500' :
+                    tx.status === 'completed' ? 'bg-green-500' : 'bg-red-500'
+                  }`} />
+                  <span className="font-medium">
+                    {formatAddress(tx.from)} → {formatAddress(tx.to)}
+                    {tx.type === 'nft' && tx.nft && (
+                      <span className="ml-2 text-xs bg-purple-100 text-purple-800 px-2 py-0.5 rounded-full">
+                        NFT: {tx.nft.icon} {tx.nft.name}
+                      </span>
+                    )}
+                  </span>
+                </div>
+                <div className="flex items-center gap-3">
+                  {tx.type === 'xrp' ? (
+                    <span className="font-medium">{tx.amount} XRP</span>
+                  ) : (
+                    <span className="font-medium text-purple-600">NFT</span>
+                  )}
+                  <span className={`text-xs px-2 py-0.5 rounded-full ${
+                    tx.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
+                    tx.status === 'completed' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+                  }`}>
+                    {tx.status}
+                  </span>
+                </div>
+              </div>
+            ))
           )}
         </div>
       </div>
 
-      {/* Wallet Balances and NFTs */}
+      {/* Wallet 1 Balances and NFTs */}
       <div className="absolute top-48 left-4 bg-white p-4 rounded-lg shadow-md">
-        <div className="text-sm text-gray-600">Wallet 1 Balance</div>
+        <div className="flex justify-between items-center mb-2">
+          <div className="text-sm text-gray-600">Wallet 1 Balance</div>
+          <button
+            onClick={() => resetWallet(WALLET1_KEY)}
+            className="text-xs bg-red-100 hover:bg-red-200 text-red-700 px-2 py-1 rounded transition-colors"
+            title="Reset wallet and get new funded account"
+          >
+            Reset Wallet
+          </button>
+        </div>
         <div className="text-xl font-bold text-blue-600">
           {wallet1Balance?.toFixed(2)} XRP
         </div>
@@ -676,14 +698,14 @@ export default function Home() {
             ))}
           </div>
           <div className="mt-4">
-            <div className="text-sm font-semibold text-gray-600 mb-2">Your NFTs (Click to Transfer)</div>
+            <div className="text-sm font-semibold text-gray-600 mb-2">Your Non-Transferable NFTs</div>
             <div className="flex flex-wrap gap-2">
               {wallet1NFTs.map(nft => (
                 <button
                   key={nft.id}
                   onClick={() => transferNFT(nft)}
                   className="w-8 h-8 flex items-center justify-center bg-purple-100 rounded hover:bg-purple-200 transition-colors"
-                  title={`Transfer ${nft.name} NFT`}
+                  title={`Transfer ${nft.name} (Non-Transferable NFT) as Issuer`}
                 >
                   {nft.icon}
                 </button>
@@ -697,7 +719,16 @@ export default function Home() {
       </div>
       
       <div className="absolute top-48 right-4 bg-white p-4 rounded-lg shadow-md">
-        <div className="text-sm text-gray-600">Wallet 2 Balance</div>
+        <div className="flex justify-between items-center mb-2">
+          <div className="text-sm text-gray-600">Wallet 2 Balance</div>
+          <button
+            onClick={() => resetWallet(WALLET2_KEY)}
+            className="text-xs bg-red-100 hover:bg-red-200 text-red-700 px-2 py-1 rounded transition-colors"
+            title="Reset wallet and get new funded account"
+          >
+            Reset Wallet
+          </button>
+        </div>
         <div className="text-xl font-bold text-blue-600">
           {wallet2Balance?.toFixed(2)} XRP
         </div>
