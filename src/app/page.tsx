@@ -339,6 +339,36 @@ export default function Home() {
         if (acceptResult.result.meta && typeof acceptResult.result.meta !== 'string' && 
             acceptResult.result.meta.TransactionResult === "tesSUCCESS") {
           
+          // After successful transfer, make the NFT soulbound by removing transfer flag
+          const makeSoulboundTx = {
+            TransactionType: "NFTokenBurn" as const,
+            Account: wallet2.address,
+            NFTokenID: nft.tokenId
+          };
+
+          // Mint a new soulbound version
+          const newSoulboundTx = {
+            TransactionType: "NFTokenMint" as const,
+            Account: wallet2.address,
+            NFTokenTaxon: 0,
+            Flags: 1, // Only burnable, not transferable (soulbound)
+            URI: Buffer.from(JSON.stringify({
+              name: nft.name,
+              icon: nft.icon,
+              soulbound: true,
+              originalTokenId: nft.tokenId
+            })).toString('hex').toUpperCase()
+          };
+
+          // Execute both transactions
+          const preparedBurn = await client.autofill(makeSoulboundTx);
+          const signedBurn = wallet2.sign(preparedBurn);
+          await client.submitAndWait(signedBurn.tx_blob);
+
+          const preparedMint = await client.autofill(newSoulboundTx);
+          const signedMint = wallet2.sign(preparedMint);
+          await client.submitAndWait(signedMint.tx_blob);
+          
           // Reload NFTs for both wallets
           const [updatedWallet1NFTs, updatedWallet2NFTs] = await Promise.all([
             loadWalletNFTs(client, wallet1.address),
@@ -355,7 +385,7 @@ export default function Home() {
                 : tx
             )
           );
-          console.log('✅ NFT transfer completed:', { transactionId });
+          console.log('✅ NFT transfer completed and made soulbound:', { transactionId });
         } else {
           throw new Error("Failed to accept NFT offer");
         }
@@ -675,14 +705,14 @@ export default function Home() {
           {wallet2?.address}
         </div>
         <div className="mt-4">
-          <div className="text-sm font-semibold text-gray-600 mb-2">Received NFTs (Click to Burn)</div>
+          <div className="text-sm font-semibold text-gray-600 mb-2">Received Soulbound NFTs (Click to Burn)</div>
           <div className="flex flex-wrap gap-2">
             {wallet2NFTs.map(nft => (
               <button
                 key={nft.id}
                 onClick={() => burnNFT(nft)}
                 className="w-8 h-8 flex items-center justify-center bg-red-100 hover:bg-red-200 rounded transition-colors"
-                title={`Burn ${nft.name} NFT`}
+                title={`Burn ${nft.name} (Soulbound NFT)`}
               >
                 {nft.icon}
               </button>
