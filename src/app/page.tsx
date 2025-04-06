@@ -736,7 +736,7 @@ export default function Home() {
           {wallet2?.address}
         </div>
         <div className="mt-4">
-          <div className="text-sm font-semibold text-gray-600 mb-2">Received Soulbound NFTs (Click to Burn)</div>
+          <div className="text-sm font-semibold text-gray-600 mb-2">Received Soulbound NFTs</div>
           <div className="flex flex-wrap gap-2">
             {wallet2NFTs.map(nft => (
               <button
