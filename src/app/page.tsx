@@ -38,6 +38,23 @@ interface LogMessage {
   timestamp: number;
 }
 
+interface PaymentChannelResponse {
+  result: {
+    signature?: string;
+    signature_verified?: boolean;
+    status: string;
+  }
+}
+
+interface PaymentChannelMeta {
+  AffectedNodes: Array<{
+    CreatedNode?: {
+      LedgerEntryType: string;
+      LedgerIndex: string;
+    }
+  }>;
+}
+
 export default function Home() {
   const [isCallActive, setIsCallActive] = useState(false);
   const [time, setTime] = useState(0);
@@ -51,6 +68,9 @@ export default function Home() {
   const [wallet1NFTs, setWallet1NFTs] = useState<NFTData[]>([]);
   const [wallet2NFTs, setWallet2NFTs] = useState<NFTData[]>([]);
   const [selectedNFT, setSelectedNFT] = useState<NFTData | null>(null);
+  const [channelId, setChannelId] = useState<string | null>(null);
+  const [totalTransferred, setTotalTransferred] = useState(0);
+  const [lastAuthorizedAmount, setLastAuthorizedAmount] = useState(0);
   const [logs, setLogs] = useState<LogMessage[]>([]);
 
   // Add log helper function
@@ -441,33 +461,242 @@ export default function Home() {
     }
   };
 
-  // Handle XRP transfer
-  const transferXRP = async () => {
+  // Function to create a payment channel
+  const createPaymentChannel = async () => {
     if (!client || !wallet1 || !wallet2) return;
-
-    addLog('🔄 Starting XRP transfer');
-
+    
     try {
-      const payment = {
-        TransactionType: "Payment" as const,
+      addLog('🔄 Creating payment channel');
+      
+      const channelTx = {
+        TransactionType: "PaymentChannelCreate" as const,
         Account: wallet1.address,
+        Amount: xrpToDrops(10), // Changed from 100 to 10 XRP
         Destination: wallet2.address,
-        Amount: xrpToDrops(TRANSFER_AMOUNT)
+        SettleDelay: 0,
+        PublicKey: wallet1.publicKey,
       };
 
-      addLog('📝 Payment prepared');
-      const prepared = await client.autofill(payment);
-      addLog('✍️ Payment signed');
+      const prepared = await client.autofill(channelTx);
+      console.log('Payment Channel Create - Prepared TX:', prepared);
+      
       const signed = wallet1.sign(prepared);
+      console.log('Payment Channel Create - Signed TX Hash:', signed.hash);
+      
       const result = await client.submitAndWait(signed.tx_blob);
+      console.log('Payment Channel Create - Server Response:', result.result);
+
+      if (result.result.meta && typeof result.result.meta !== 'string') {
+        const meta = result.result.meta as unknown as PaymentChannelMeta;
+        const node = meta.AffectedNodes.find(node => 
+          node.CreatedNode?.LedgerEntryType === "PayChannel"
+        );
+        
+        if (node?.CreatedNode) {
+          const newChannelId = node.CreatedNode.LedgerIndex;
+          setChannelId(newChannelId);
+          addLog(`✅ Payment channel created with 10 XRP reserve`);
+          return newChannelId;
+        }
+      }
+      throw new Error("Failed to create payment channel");
+    } catch (error) {
+      addLog('❌ Payment channel creation failed');
+      if (error instanceof Error) {
+        console.error('Payment Channel Create - Error:', error);
+      }
+      setStatus("Error creating payment channel");
+      return null;
+    }
+  };
+
+  // Function to authorize a claim on the payment channel
+  const authorizePaymentChannelClaim = async (amount: number) => {
+    if (!client || !wallet1 || !channelId) return null;
+    
+    try {
+      addLog('🔐 Authorizing payment channel claim');
+      console.log('Payment Channel Authorize - Request:', {
+        channel_id: channelId,
+        amount: xrpToDrops(amount)
+      });
+      
+      const response = await client.request({
+        command: "channel_authorize" as any,
+        channel_id: channelId,
+        amount: xrpToDrops(amount),
+        secret: wallet1.seed!
+      }) as PaymentChannelResponse;
+
+      console.log('Payment Channel Authorize - Response:', response.result);
+
+      if (response.result?.signature) {
+        addLog('✅ Claim authorized');
+        return {
+          signature: response.result.signature,
+          amount: xrpToDrops(amount)
+        };
+      }
+      throw new Error("Failed to authorize claim");
+    } catch (error) {
+      addLog('❌ Claim authorization failed');
+      if (error instanceof Error) {
+        console.error('Payment Channel Authorize - Error:', error);
+      }
+      return null;
+    }
+  };
+
+  // Function to verify a payment channel claim
+  const verifyPaymentChannelClaim = async (signature: string, amount: string) => {
+    if (!client || !wallet1 || !channelId) return false;
+    
+    try {
+      addLog('🔍 Verifying payment channel claim');
+      console.log('Payment Channel Verify - Request:', {
+        channel_id: channelId,
+        amount,
+        signature: signature.slice(0, 32) + '...'
+      });
+      
+      const response = await client.request({
+        command: "channel_verify" as any,
+        channel_id: channelId,
+        signature: signature,
+        public_key: wallet1.publicKey,
+        amount: amount
+      }) as PaymentChannelResponse;
+
+      console.log('Payment Channel Verify - Response:', response.result);
+
+      if (response.result?.signature_verified) {
+        addLog('✅ Claim verified');
+        return true;
+      }
+      addLog('⚠️ Claim verification failed');
+      return false;
+    } catch (error) {
+      addLog('❌ Claim verification failed');
+      if (error instanceof Error) {
+        console.error('Payment Channel Verify - Error:', error);
+      }
+      return false;
+    }
+  };
+
+  // Function to claim XRP from the payment channel
+  const claimPaymentChannel = async (signature: string, amount: string) => {
+    if (!client || !wallet2 || !channelId) return;
+    
+    try {
+      addLog('💰 Claiming from payment channel');
+      
+      const claimTx = {
+        TransactionType: "PaymentChannelClaim" as const,
+        Account: wallet2.address,
+        Channel: channelId,
+        Amount: amount,
+        Balance: amount,
+        Signature: signature,
+        PublicKey: wallet1?.publicKey
+      };
+
+      const prepared = await client.autofill(claimTx);
+      console.log('Payment Channel Claim - Prepared TX:', prepared);
+      
+      const signed = wallet2.sign(prepared);
+      console.log('Payment Channel Claim - Signed TX Hash:', signed.hash);
+      
+      const result = await client.submitAndWait(signed.tx_blob);
+      console.log('Payment Channel Claim - Server Response:', result.result);
 
       if (result.result.meta && typeof result.result.meta !== 'string' && 
           result.result.meta.TransactionResult === "tesSUCCESS") {
-        await updateBalances(client, wallet1, wallet2);
-        addLog('✅ Transfer completed');
-      } else {
-        throw new Error("Transaction failed");
+        await updateBalances(client, wallet1!, wallet2);
+        addLog('✅ Payment channel claim successful');
+        return true;
       }
+      return false;
+    } catch (error) {
+      addLog('❌ Payment channel claim failed');
+      if (error instanceof Error) {
+        console.error('Payment Channel Claim - Error:', error);
+      }
+      return false;
+    }
+  };
+
+  // Function to close the payment channel
+  const closePaymentChannel = async () => {
+    if (!client || !wallet1 || !channelId) return;
+    
+    try {
+      addLog('🔒 Closing payment channel');
+      
+      const closeTx = {
+        TransactionType: "PaymentChannelClaim" as const,
+        Account: wallet1.address,
+        Channel: channelId,
+        Flags: {
+          tfClose: true,
+          tfRenew: false
+        }, // tfClose flag
+        Amount: "0" // Required for TypeScript
+      };
+
+      const prepared = await client.autofill(closeTx);
+      console.log('Payment Channel Close - Prepared TX:', prepared);
+      
+      const signed = wallet1.sign(prepared);
+      console.log('Payment Channel Close - Signed TX Hash:', signed.hash);
+      
+      const result = await client.submitAndWait(signed.tx_blob);
+      console.log('Payment Channel Close - Server Response:', result.result);
+
+      if (result.result.meta && typeof result.result.meta !== 'string' && 
+          result.result.meta.TransactionResult === "tesSUCCESS") {
+        setChannelId(null);
+        setTotalTransferred(0);
+        addLog('✅ Payment channel closed');
+        return true;
+      }
+      return false;
+    } catch (error) {
+      addLog('❌ Payment channel close failed');
+      if (error instanceof Error) {
+        console.error('Payment Channel Close - Error:', error);
+      }
+      return false;
+    }
+  };
+
+  // Modified transferXRP to keep growing the claim amount
+  const transferXRP = async () => {
+    if (!client || !wallet1 || !wallet2 || !channelId || !isCallActive) return;
+
+    try {
+      // Calculate new total amount (growing with each transfer)
+      const nextAuthAmount = totalTransferred + TRANSFER_AMOUNT;
+      console.log('Payment Channel Transfer - New authorization details:', {
+        previousTotal: totalTransferred,
+        nextAmount: nextAuthAmount
+      });
+      
+      // Authorize claim for the growing total
+      const claim = await authorizePaymentChannelClaim(nextAuthAmount);
+      if (!claim) return;
+
+      // Verify the claim
+      const isValid = await verifyPaymentChannelClaim(claim.signature, claim.amount);
+      if (!isValid) {
+        addLog('❌ Invalid claim');
+        return;
+      }
+
+      // Update the total transferred amount (keeps growing)
+      setTotalTransferred((prev) => prev + TRANSFER_AMOUNT);
+      addLog(`✅ Authorized ${nextAuthAmount} XRP (Growing total)`);
+      console.log('Payment Channel - Current authorized amount:', nextAuthAmount);
     } catch (error) {
       addLog('❌ Transfer failed');
       setStatus("Error during transfer");
@@ -486,7 +715,9 @@ export default function Home() {
 
       // Transfer XRP every 5 seconds
       transferInterval = setInterval(() => {
-        transferXRP();
+        if (isCallActive) { // Check if call is still active
+          transferXRP();
+        }
       }, TRANSFER_INTERVAL * 1000);
     }
 
@@ -504,15 +735,83 @@ export default function Home() {
     return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
   };
 
-  const handleStartCall = () => {
-    setIsCallActive(true);
-    setStatus("Call active - transferring XRP");
+  const handleStartCall = async () => {
+    if (!client || !wallet1 || !wallet2) return;
+
+    try {
+      // Create payment channel before starting the call
+      addLog('🚀 Starting call - creating payment channel');
+      const newChannelId = await createPaymentChannel();
+      if (!newChannelId) {
+        setStatus("Failed to create payment channel");
+        return;
+      }
+
+      // Update balances immediately after channel creation
+      await updateBalances(client, wallet1, wallet2);
+      addLog('💰 Balances updated after channel creation');
+
+      // Reset amounts when starting new call
+      setLastAuthorizedAmount(0);
+      setTotalTransferred(0);
+      setIsCallActive(true);
+      setStatus("Call active - payment channel ready");
+      addLog('📞 Call started with active payment channel');
+    } catch (error) {
+      addLog('❌ Failed to start call');
+      setStatus("Error starting call");
+    }
   };
 
-  const handleEndCall = () => {
-    setIsCallActive(false);
-    setTime(0);
-    setStatus("Call ended");
+  const handleEndCall = async () => {
+    if (!client || !wallet1 || !wallet2 || !channelId) {
+      setIsCallActive(false);
+      setTime(0);
+      setStatus("Call ended");
+      return;
+    }
+
+    try {
+      // First, stop active transfers
+      setIsCallActive(false);
+      addLog('🔄 Ending call - processing final claim');
+      
+      // Make final claim using the total transferred amount
+      if (totalTransferred > 0) {
+        console.log('Payment Channel End - Final claim amount:', totalTransferred);
+        
+        // Get final authorization for the total amount
+        const finalClaim = await authorizePaymentChannelClaim(totalTransferred);
+        if (finalClaim) {
+          const isValid = await verifyPaymentChannelClaim(finalClaim.signature, finalClaim.amount);
+          if (isValid) {
+            // Claim the total amount
+            await claimPaymentChannel(finalClaim.signature, finalClaim.amount);
+            addLog(`💰 Final claim processed: ${totalTransferred} XRP`);
+            
+            // Update balances after final claim
+            await updateBalances(client, wallet1, wallet2);
+            addLog('💰 Final balances updated');
+          }
+        }
+      }
+
+      // Close the payment channel
+      await closePaymentChannel();
+      
+      setTime(0);
+      setTotalTransferred(0);
+      setLastAuthorizedAmount(0);
+      setStatus("Call ended - payment channel closed");
+      addLog('📞 Call ended successfully');
+    } catch (error) {
+      addLog('❌ Error during call end process');
+      setStatus("Error ending call");
+      setIsCallActive(false);
+      setTime(0);
+      setTotalTransferred(0);
+      setLastAuthorizedAmount(0);
+    }
   };
 
   const formatAddress = (address: string) => {
