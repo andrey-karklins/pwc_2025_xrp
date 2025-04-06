@@ -8,7 +8,6 @@ const TRANSFER_INTERVAL = 5; // Transfer every 5 seconds
 const MAX_TRANSACTIONS = 4; // Maximum number of transactions to show
 const WALLET1_KEY = 'xrpl_wallet1';
 const WALLET2_KEY = 'xrpl_wallet2';
-const RLUSD_ISSUER = 'rQhWct2fv4Vc4KRjRgMrxa8xPN9Zx9iLKV';
 
 interface Transaction {
   id: string;
@@ -17,78 +16,12 @@ interface Transaction {
   amount: number;
   from: string;
   to: string;
-  sourceAmount?: string;
-  destinationAmount?: string;
-  sourceCurrency?: string;
-  destinationCurrency?: string;
 }
 
 interface StoredWallet {
   address: string;
   seed: string;
 }
-
-// Helper function to set up trust line for RLUSD
-const setupTrustLine = async (client: Client, wallet: Wallet) => {
-  try {
-    console.log('🔗 Setting up trust line:', { wallet: wallet.address, currency: "USD", issuer: RLUSD_ISSUER });
-
-    const trustSetTx = {
-      TransactionType: "TrustSet" as const,
-      Account: wallet.address,
-      LimitAmount: {
-        currency: "USD",
-        issuer: RLUSD_ISSUER,
-        value: "100" // High limit for testing
-      }
-    };
-
-    const prepared = await client.autofill(trustSetTx);
-    console.log('📝 Trust line prepared:', { 
-      fee: (prepared as any).Fee,
-      sequence: (prepared as any).Sequence
-    });
-
-    const signed = wallet.sign(prepared);
-    console.log('✍️ Trust line signed:', { hash: signed.hash });
-
-    const result = await client.submitAndWait(signed.tx_blob);
-    console.log('📬 Trust line result:', { 
-      status: result.result.meta && typeof result.result.meta !== 'string' ? result.result.meta.TransactionResult : 'unknown'
-    });
-    
-    if (result.result.meta && typeof result.result.meta !== 'string') {
-      return result.result.meta.TransactionResult === "tesSUCCESS";
-    }
-    return false;
-  } catch (error) {
-    console.error('❌ Trust line error:', error);
-    return false;
-  }
-};
-
-// Helper function to check if trust line exists
-const checkTrustLine = async (client: Client, address: string) => {
-  try {
-    console.log('🔍 Checking trust line:', { address });
-
-    const lines = await client.request({
-      command: "account_lines",
-      account: address,
-      peer: RLUSD_ISSUER
-    });
-    
-    const hasTrustLine = lines.result.lines.some(line => 
-      line.currency === "USD" && line.account === RLUSD_ISSUER
-    );
-    console.log('👀 Trust line status:', { address, exists: hasTrustLine });
-
-    return hasTrustLine;
-  } catch (error) {
-    console.error('❌ Trust line check error:', error);
-    return false;
-  }
-};
 
 // Helper function to manage wallet creation/retrieval
 const getOrCreateWallet = async (client: Client, storageKey: string): Promise<Wallet> => {
@@ -141,8 +74,6 @@ export default function Home() {
   const [status, setStatus] = useState<string>("");
   const [isLoading, setIsLoading] = useState(true);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [wallet1RLUSDBalance, setWallet1RLUSDBalance] = useState<string>("0");
-  const [wallet2RLUSDBalance, setWallet2RLUSDBalance] = useState<string>("0");
 
   // Initialize XRPL client and wallets
   useEffect(() => {
@@ -157,18 +88,6 @@ export default function Home() {
         const testWallet1 = await getOrCreateWallet(xrplClient, WALLET1_KEY);
         const testWallet2 = await getOrCreateWallet(xrplClient, WALLET2_KEY);
         
-        setStatus("Setting up trust lines...");
-        // Check and setup trust lines for both wallets
-        const wallet1HasTrust = await checkTrustLine(xrplClient, testWallet1.address);
-        const wallet2HasTrust = await checkTrustLine(xrplClient, testWallet2.address);
-        
-        if (!wallet1HasTrust) {
-          await setupTrustLine(xrplClient, testWallet1);
-        }
-        if (!wallet2HasTrust) {
-          await setupTrustLine(xrplClient, testWallet2);
-        }
-
         setWallet1(testWallet1);
         setWallet2(testWallet2);
 
@@ -213,37 +132,13 @@ export default function Home() {
 
       setWallet1Balance(Number(balance1));
       setWallet2Balance(Number(balance2));
-
-      const [lines1, lines2] = await Promise.all([
-        xrplClient.request({
-          command: "account_lines",
-          account: w1.address,
-          peer: RLUSD_ISSUER
-        }),
-        xrplClient.request({
-          command: "account_lines",
-          account: w2.address,
-          peer: RLUSD_ISSUER
-        })
-      ]);
-
-      const rlusd1 = lines1.result.lines.find(l => l.currency === "USD")?.balance || "0";
-      const rlusd2 = lines2.result.lines.find(l => l.currency === "USD")?.balance || "0";
-      
-      console.log('💵 RLUSD balances:', {
-        wallet1: { address: w1.address, balance: rlusd1 },
-        wallet2: { address: w2.address, balance: rlusd2 }
-      });
-
-      setWallet1RLUSDBalance(rlusd1);
-      setWallet2RLUSDBalance(rlusd2);
     } catch (error) {
       console.error('❌ Balance update error:', error);
       setStatus("Error updating balances");
     }
   };
 
-  // Handle XRP to RLUSD exchange and transfer
+  // Handle XRP transfer
   const transferXRP = async () => {
     if (!client || !wallet1 || !wallet2) return;
 
@@ -261,11 +156,7 @@ export default function Home() {
       status: 'pending',
       amount: TRANSFER_AMOUNT,
       from: wallet1.address,
-      to: wallet2.address,
-      sourceCurrency: "XRP",
-      destinationCurrency: "USD",
-      sourceAmount: TRANSFER_AMOUNT.toString(),
-      destinationAmount: (TRANSFER_AMOUNT * 1).toString()
+      to: wallet2.address
     };
 
     setTransactions(prev => [newTransaction, ...prev].slice(0, MAX_TRANSACTIONS));
@@ -275,42 +166,19 @@ export default function Home() {
         TransactionType: "Payment" as const,
         Account: wallet1.address,
         Destination: wallet2.address,
-        Amount: {
-          currency: "USD",
-          value: (TRANSFER_AMOUNT * 1).toString(),
-          issuer: RLUSD_ISSUER
-        },
-        SendMax: xrpToDrops(TRANSFER_AMOUNT * 1.05),
-        Paths: [[
-          {
-            currency: "USD",
-            issuer: RLUSD_ISSUER,
-            type: 48,
-            type_hex: "0000000000000030"
-          }
-        ]]
+        Amount: xrpToDrops(TRANSFER_AMOUNT)
       };
 
-      console.log('📝 Payment prepared:', { 
-        from: payment.Account,
-        to: payment.Destination,
-        amount: payment.Amount
-      });
+      console.log('📝 Payment prepared:', payment);
 
       const prepared = await client.autofill(payment);
-      console.log('✍️ Payment autofilled:', { 
-        fee: (prepared as any).Fee,
-        sequence: (prepared as any).Sequence
-      });
+      console.log('✍️ Payment autofilled:', prepared);
 
       const signed = wallet1.sign(prepared);
       console.log('📋 Payment signed:', { hash: signed.hash });
 
       const result = await client.submitAndWait(signed.tx_blob);
-      console.log('📬 Payment result:', { 
-        status: result.result.meta && typeof result.result.meta !== 'string' ? result.result.meta.TransactionResult : 'unknown',
-        hash: result.result.hash
-      });
+      console.log('📬 Payment result:', result.result);
 
       if (result.result.meta && typeof result.result.meta !== 'string' && 
           result.result.meta.TransactionResult === "tesSUCCESS") {
@@ -341,7 +209,7 @@ export default function Home() {
       );
     }
   };
-  
+
   useEffect(() => {
     let timerInterval: NodeJS.Timeout;
     let transferInterval: NodeJS.Timeout;
@@ -412,15 +280,10 @@ export default function Home() {
                   tx.status === 'pending' ? 'bg-yellow-500' :
                   tx.status === 'completed' ? 'bg-green-500' : 'bg-red-500'
                 }`} />
-                <span className="font-medium">
-                  {formatAddress(tx.from)} → {formatAddress(tx.to)}
-                  <span className="text-xs text-gray-500 ml-2">
-                    ({tx.sourceCurrency} → {tx.destinationCurrency})
-                  </span>
-                </span>
+                <span className="font-medium">{formatAddress(tx.from)} → {formatAddress(tx.to)}</span>
               </div>
               <div className="flex items-center gap-3">
-                <span className="font-medium">{tx.sourceAmount} {tx.sourceCurrency}</span>
+                <span className="font-medium">{tx.amount} XRP</span>
                 <span className={`text-xs px-2 py-0.5 rounded-full ${
                   tx.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
                   tx.status === 'completed' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
@@ -444,9 +307,6 @@ export default function Home() {
         <div className="text-xl font-bold text-blue-600">
           {wallet1Balance?.toFixed(2)} XRP
         </div>
-        <div className="text-lg font-semibold text-green-600">
-          {Number(wallet1RLUSDBalance).toFixed(2)} RLUSD
-        </div>
         <div className="text-xs text-gray-500 mt-1 break-all">
           {wallet1?.address}
         </div>
@@ -456,9 +316,6 @@ export default function Home() {
         <div className="text-sm text-gray-600">Wallet 2 Balance</div>
         <div className="text-xl font-bold text-blue-600">
           {wallet2Balance?.toFixed(2)} XRP
-        </div>
-        <div className="text-lg font-semibold text-green-600">
-          {Number(wallet2RLUSDBalance).toFixed(2)} RLUSD
         </div>
         <div className="text-xs text-gray-500 mt-1 break-all">
           {wallet2?.address}
