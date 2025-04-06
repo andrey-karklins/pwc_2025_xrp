@@ -9,6 +9,23 @@ const MAX_TRANSACTIONS = 4; // Maximum number of transactions to show
 const WALLET1_KEY = 'xrpl_wallet1';
 const WALLET2_KEY = 'xrpl_wallet2';
 
+// NFT Icons data
+const NFT_ICONS = [
+  { id: 1, emoji: "🎮", name: "Game Controller" },
+  { id: 2, emoji: "🎨", name: "Art Palette" },
+  { id: 3, emoji: "🎵", name: "Musical Note" },
+  { id: 4, emoji: "📸", name: "Camera" },
+  { id: 5, emoji: "🌟", name: "Star" },
+];
+
+interface NFTData {
+  id: string;
+  tokenId: string;
+  icon: string;
+  name: string;
+  owner: string;
+}
+
 interface Transaction {
   id: string;
   timestamp: number;
@@ -16,6 +33,8 @@ interface Transaction {
   amount: number;
   from: string;
   to: string;
+  type: 'xrp' | 'nft';
+  nft?: NFTData;
 }
 
 interface StoredWallet {
@@ -63,6 +82,72 @@ const getOrCreateWallet = async (client: Client, storageKey: string): Promise<Wa
   }
 };
 
+// Helper function to load NFTs for a wallet
+const loadWalletNFTs = async (client: Client, address: string): Promise<NFTData[]> => {
+  try {
+    console.log('📥 Loading NFTs for wallet:', { address });
+
+    const response = await client.request({
+      command: "account_nfts",
+      account: address
+    });
+
+    const nfts = await Promise.all(response.result.account_nfts.map(async (nft) => {
+      try {
+        // If URI exists, try to decode it
+        if (nft.URI) {
+          const decoded = Buffer.from(nft.URI, 'hex').toString();
+          const metadata = JSON.parse(decoded);
+          return {
+            id: `nft_${nft.NFTokenID}`,
+            tokenId: nft.NFTokenID,
+            icon: metadata.icon || '❓',
+            name: metadata.name || 'Unknown NFT',
+            owner: address
+          };
+        }
+        // Fallback for NFTs without metadata
+        return {
+          id: `nft_${nft.NFTokenID}`,
+          tokenId: nft.NFTokenID,
+          icon: '❓',
+          name: `NFT #${nft.NFTokenTaxon}`,
+          owner: address
+        };
+      } catch (error) {
+        console.warn('⚠️ Error parsing NFT metadata:', error);
+        return {
+          id: `nft_${nft.NFTokenID}`,
+          tokenId: nft.NFTokenID,
+          icon: '❓',
+          name: `NFT #${nft.NFTokenTaxon}`,
+          owner: address
+        };
+      }
+    }));
+
+    console.log('📦 Loaded NFTs:', { address, count: nfts.length, nfts });
+    return nfts;
+  } catch (error) {
+    console.error('❌ Error loading NFTs:', error);
+    return [];
+  }
+};
+
+// Helper function to get NFT offers
+const getNFTOffers = async (client: Client, tokenId: string) => {
+  try {
+    const response = await client.request({
+      command: "nft_sell_offers",
+      nft_id: tokenId
+    });
+    return response.result.offers || [];
+  } catch (error) {
+    console.error('❌ Error getting NFT offers:', error);
+    return [];
+  }
+};
+
 export default function Home() {
   const [isCallActive, setIsCallActive] = useState(false);
   const [time, setTime] = useState(0);
@@ -74,6 +159,9 @@ export default function Home() {
   const [status, setStatus] = useState<string>("");
   const [isLoading, setIsLoading] = useState(true);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [wallet1NFTs, setWallet1NFTs] = useState<NFTData[]>([]);
+  const [wallet2NFTs, setWallet2NFTs] = useState<NFTData[]>([]);
+  const [selectedNFT, setSelectedNFT] = useState<NFTData | null>(null);
 
   // Initialize XRPL client and wallets
   useEffect(() => {
@@ -92,6 +180,16 @@ export default function Home() {
         setWallet2(testWallet2);
 
         await updateBalances(xrplClient, testWallet1, testWallet2);
+
+        // Load existing NFTs for both wallets
+        setStatus("Loading NFTs...");
+        const [wallet1Nfts, wallet2Nfts] = await Promise.all([
+          loadWalletNFTs(xrplClient, testWallet1.address),
+          loadWalletNFTs(xrplClient, testWallet2.address)
+        ]);
+
+        setWallet1NFTs(wallet1Nfts);
+        setWallet2NFTs(wallet2Nfts);
         
         setIsLoading(false);
         setStatus("Ready to start call");
@@ -138,6 +236,148 @@ export default function Home() {
     }
   };
 
+  // Function to mint a new NFT
+  const mintNFT = async (icon: { id: number; emoji: string; name: string }) => {
+    if (!client || !wallet1) return;
+
+    try {
+      console.log('🎨 Minting NFT:', icon);
+
+      const mintTx = {
+        TransactionType: "NFTokenMint" as const,
+        Account: wallet1.address,
+        NFTokenTaxon: icon.id,
+        Flags: 8,
+        URI: Buffer.from(JSON.stringify({
+          name: icon.name,
+          icon: icon.emoji
+        })).toString('hex').toUpperCase()
+      };
+
+      const prepared = await client.autofill(mintTx);
+      const signed = wallet1.sign(prepared);
+      const result = await client.submitAndWait(signed.tx_blob);
+
+      if (result.result.meta && typeof result.result.meta !== 'string') {
+        // Reload NFTs to get the new one
+        const updatedNFTs = await loadWalletNFTs(client, wallet1.address);
+        setWallet1NFTs(updatedNFTs);
+        console.log('✅ NFT minted and loaded');
+      }
+    } catch (error) {
+      console.error('❌ NFT minting error:', error);
+      setStatus("Error minting NFT");
+    }
+  };
+
+  // Function to transfer NFT
+  const transferNFT = async (nft: NFTData) => {
+    if (!client || !wallet1 || !wallet2) return;
+
+    const transactionId = `tx_${Date.now()}`;
+    console.log('🔄 Starting NFT transfer:', {
+      id: transactionId,
+      tokenId: nft.tokenId,
+      from: wallet1.address,
+      to: wallet2.address
+    });
+
+    const newTransaction: Transaction = {
+      id: transactionId,
+      timestamp: Date.now(),
+      status: 'pending',
+      amount: 0,
+      from: wallet1.address,
+      to: wallet2.address,
+      type: 'nft',
+      nft
+    };
+
+    setTransactions(prev => [newTransaction, ...prev].slice(0, MAX_TRANSACTIONS));
+
+    try {
+      // Step 1: Create the offer
+      console.log('📤 Creating NFT offer...');
+      const createOfferTx = {
+        TransactionType: "NFTokenCreateOffer" as const,
+        Account: wallet1.address,
+        NFTokenID: nft.tokenId,
+        Destination: wallet2.address,
+        Amount: "0",
+        Flags: 1
+      };
+
+      const preparedOffer = await client.autofill(createOfferTx);
+      const signedOffer = wallet1.sign(preparedOffer);
+      const offerResult = await client.submitAndWait(signedOffer.tx_blob);
+
+      if (offerResult.result.meta && typeof offerResult.result.meta !== 'string' && 
+          offerResult.result.meta.TransactionResult === "tesSUCCESS") {
+        
+        // Step 2: Get the offer ID
+        console.log('🔍 Getting NFT offers...');
+        const offers = await getNFTOffers(client, nft.tokenId);
+        
+        if (offers.length === 0) {
+          throw new Error("No offers found for NFT");
+        }
+
+        const offer = offers[0];
+        console.log('📥 Accepting NFT offer:', offer);
+
+        // Step 3: Accept the offer
+        const acceptOfferTx = {
+          TransactionType: "NFTokenAcceptOffer" as const,
+          Account: wallet2.address,
+          NFTokenSellOffer: offer.nft_offer_index
+        };
+
+        const preparedAccept = await client.autofill(acceptOfferTx);
+        const signedAccept = wallet2.sign(preparedAccept);
+        const acceptResult = await client.submitAndWait(signedAccept.tx_blob);
+
+        if (acceptResult.result.meta && typeof acceptResult.result.meta !== 'string' && 
+            acceptResult.result.meta.TransactionResult === "tesSUCCESS") {
+          
+          // Reload NFTs for both wallets
+          const [updatedWallet1NFTs, updatedWallet2NFTs] = await Promise.all([
+            loadWalletNFTs(client, wallet1.address),
+            loadWalletNFTs(client, wallet2.address)
+          ]);
+          
+          setWallet1NFTs(updatedWallet1NFTs);
+          setWallet2NFTs(updatedWallet2NFTs);
+          
+          setTransactions(prev => 
+            prev.map(tx => 
+              tx.id === transactionId 
+                ? { ...tx, status: 'completed' } 
+                : tx
+            )
+          );
+          console.log('✅ NFT transfer completed:', { transactionId });
+        } else {
+          throw new Error("Failed to accept NFT offer");
+        }
+      } else {
+        throw new Error("Failed to create NFT offer");
+      }
+    } catch (error) {
+      console.error('❌ NFT transfer failed:', {
+        transactionId,
+        error: error instanceof Error ? error.message : "Unknown error"
+      });
+      setStatus(error instanceof Error ? error.message : "Error transferring NFT");
+      setTransactions(prev => 
+        prev.map(tx => 
+          tx.id === transactionId 
+            ? { ...tx, status: 'failed' } 
+            : tx
+        )
+      );
+    }
+  };
+
   // Handle XRP transfer
   const transferXRP = async () => {
     if (!client || !wallet1 || !wallet2) return;
@@ -156,7 +396,8 @@ export default function Home() {
       status: 'pending',
       amount: TRANSFER_AMOUNT,
       from: wallet1.address,
-      to: wallet2.address
+      to: wallet2.address,
+      type: 'xrp'
     };
 
     setTransactions(prev => [newTransaction, ...prev].slice(0, MAX_TRANSACTIONS));
@@ -256,6 +497,75 @@ export default function Home() {
     return `${address.slice(0, 6)}...${address.slice(-6)}`;
   };
 
+  // Function to burn/destroy an NFT
+  const burnNFT = async (nft: NFTData) => {
+    if (!client || !wallet2) return;
+
+    const transactionId = `tx_${Date.now()}`;
+    console.log('🔥 Burning NFT:', {
+      id: transactionId,
+      tokenId: nft.tokenId,
+      owner: wallet2.address
+    });
+
+    const newTransaction: Transaction = {
+      id: transactionId,
+      timestamp: Date.now(),
+      status: 'pending',
+      amount: 0,
+      from: wallet2.address,
+      to: 'BURN',
+      type: 'nft',
+      nft
+    };
+
+    setTransactions(prev => [newTransaction, ...prev].slice(0, MAX_TRANSACTIONS));
+
+    try {
+      const burnTx = {
+        TransactionType: "NFTokenBurn" as const,
+        Account: wallet2.address,
+        NFTokenID: nft.tokenId
+      };
+
+      const prepared = await client.autofill(burnTx);
+      const signed = wallet2.sign(prepared);
+      const result = await client.submitAndWait(signed.tx_blob);
+
+      if (result.result.meta && typeof result.result.meta !== 'string' && 
+          result.result.meta.TransactionResult === "tesSUCCESS") {
+        
+        // Reload NFTs for wallet2
+        const updatedWallet2NFTs = await loadWalletNFTs(client, wallet2.address);
+        setWallet2NFTs(updatedWallet2NFTs);
+        
+        setTransactions(prev => 
+          prev.map(tx => 
+            tx.id === transactionId 
+              ? { ...tx, status: 'completed' } 
+              : tx
+          )
+        );
+        console.log('✅ NFT burned:', { transactionId });
+      } else {
+        throw new Error("Failed to burn NFT");
+      }
+    } catch (error) {
+      console.error('❌ NFT burn failed:', {
+        transactionId,
+        error: error instanceof Error ? error.message : "Unknown error"
+      });
+      setStatus(error instanceof Error ? error.message : "Error burning NFT");
+      setTransactions(prev => 
+        prev.map(tx => 
+          tx.id === transactionId 
+            ? { ...tx, status: 'failed' } 
+            : tx
+        )
+      );
+    }
+  };
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center min-h-screen">
@@ -280,10 +590,21 @@ export default function Home() {
                   tx.status === 'pending' ? 'bg-yellow-500' :
                   tx.status === 'completed' ? 'bg-green-500' : 'bg-red-500'
                 }`} />
-                <span className="font-medium">{formatAddress(tx.from)} → {formatAddress(tx.to)}</span>
+                <span className="font-medium">
+                  {formatAddress(tx.from)} → {formatAddress(tx.to)}
+                  {tx.type === 'nft' && tx.nft && (
+                    <span className="ml-2 text-xs bg-purple-100 text-purple-800 px-2 py-0.5 rounded-full">
+                      NFT: {tx.nft.icon} {tx.nft.name}
+                    </span>
+                  )}
+                </span>
               </div>
               <div className="flex items-center gap-3">
-                <span className="font-medium">{tx.amount} XRP</span>
+                {tx.type === 'xrp' ? (
+                  <span className="font-medium">{tx.amount} XRP</span>
+                ) : (
+                  <span className="font-medium text-purple-600">NFT</span>
+                )}
                 <span className={`text-xs px-2 py-0.5 rounded-full ${
                   tx.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
                   tx.status === 'completed' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
@@ -301,7 +622,7 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Wallet Balances */}
+      {/* Wallet Balances and NFTs */}
       <div className="absolute top-48 left-4 bg-white p-4 rounded-lg shadow-md">
         <div className="text-sm text-gray-600">Wallet 1 Balance</div>
         <div className="text-xl font-bold text-blue-600">
@@ -309,6 +630,39 @@ export default function Home() {
         </div>
         <div className="text-xs text-gray-500 mt-1 break-all">
           {wallet1?.address}
+        </div>
+        <div className="mt-4">
+          <div className="text-sm font-semibold text-gray-600 mb-2">Mint New NFTs</div>
+          <div className="flex flex-wrap gap-2">
+            {NFT_ICONS.map(icon => (
+              <button
+                key={icon.id}
+                onClick={() => mintNFT(icon)}
+                className="w-8 h-8 flex items-center justify-center bg-gray-100 rounded hover:bg-gray-200 transition-colors"
+                title={`Mint ${icon.name} NFT`}
+              >
+                {icon.emoji}
+              </button>
+            ))}
+          </div>
+          <div className="mt-4">
+            <div className="text-sm font-semibold text-gray-600 mb-2">Your NFTs (Click to Transfer)</div>
+            <div className="flex flex-wrap gap-2">
+              {wallet1NFTs.map(nft => (
+                <button
+                  key={nft.id}
+                  onClick={() => transferNFT(nft)}
+                  className="w-8 h-8 flex items-center justify-center bg-purple-100 rounded hover:bg-purple-200 transition-colors"
+                  title={`Transfer ${nft.name} NFT`}
+                >
+                  {nft.icon}
+                </button>
+              ))}
+              {wallet1NFTs.length === 0 && (
+                <div className="text-sm text-gray-500">No NFTs yet</div>
+              )}
+            </div>
+          </div>
         </div>
       </div>
       
@@ -319,6 +673,24 @@ export default function Home() {
         </div>
         <div className="text-xs text-gray-500 mt-1 break-all">
           {wallet2?.address}
+        </div>
+        <div className="mt-4">
+          <div className="text-sm font-semibold text-gray-600 mb-2">Received NFTs (Click to Burn)</div>
+          <div className="flex flex-wrap gap-2">
+            {wallet2NFTs.map(nft => (
+              <button
+                key={nft.id}
+                onClick={() => burnNFT(nft)}
+                className="w-8 h-8 flex items-center justify-center bg-red-100 hover:bg-red-200 rounded transition-colors"
+                title={`Burn ${nft.name} NFT`}
+              >
+                {nft.icon}
+              </button>
+            ))}
+            {wallet2NFTs.length === 0 && (
+              <div className="text-sm text-gray-500">No NFTs received</div>
+            )}
+          </div>
         </div>
       </div>
 
